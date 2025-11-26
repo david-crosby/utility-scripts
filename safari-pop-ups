@@ -1,0 +1,354 @@
+#!/bin/zsh
+# ------------------------------------------------------------------------------
+# Safari Pop-Up Permission Manager
+# Adds specified domains to Safari's allowed pop-up sites list
+# Compatible with Jamf Pro or standalone execution
+# ------------------------------------------------------------------------------
+# Author: David Crosby
+# LinkedIn: https://www.linkedin.com/in/david-bing-crosby/
+# GitHub: https://github.com/david-crosby
+# ------------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+
+readonly SCRIPT_NAME="${0:t}"
+readonly SCRIPT_VERSION="1.0.0"
+readonly LOG_FILE="/var/log/safari-popup-manager.log"
+
+# Domains to allow pop-ups from (add more as needed)
+readonly -a ALLOWED_DOMAINS=(
+    "inset-here.com"
+)
+
+# Pop-up policy values
+readonly POPUP_ALLOW=1
+readonly POPUP_BLOCK=0
+readonly POPUP_BLOCK_NOTIFY=2
+
+# ------------------------------------------------------------------------------
+# Logging Functions
+# ------------------------------------------------------------------------------
+
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    local log_entry="[${timestamp}] [${level}] ${message}"
+    
+    echo "${log_entry}" | tee -a "${LOG_FILE}"
+}
+
+log_info() {
+    log_message "INFO" "$1"
+}
+
+log_warn() {
+    log_message "WARN" "$1"
+}
+
+log_error() {
+    log_message "ERROR" "$1"
+}
+
+log_success() {
+    log_message "SUCCESS" "$1"
+}
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+get_current_user() {
+    # Get the currently logged-in user (excluding system accounts)
+    local current_user
+    current_user=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null)
+    
+    if [[ -z "${current_user}" || "${current_user}" == "root" || "${current_user}" == "loginwindow" ]]; then
+        return 1
+    fi
+    
+    echo "${current_user}"
+}
+
+get_user_home() {
+    local username="$1"
+    local home_dir
+    home_dir=$(/usr/bin/dscl . -read "/Users/${username}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    
+    if [[ -z "${home_dir}" || ! -d "${home_dir}" ]]; then
+        return 1
+    fi
+    
+    echo "${home_dir}"
+}
+
+get_user_uid() {
+    local username="$1"
+    /usr/bin/id -u "${username}" 2>/dev/null
+}
+
+is_safari_running() {
+    /usr/bin/pgrep -x "Safari" >/dev/null 2>&1
+}
+
+wait_for_safari_quit() {
+    local max_wait=30
+    local waited=0
+    
+    while is_safari_running && [[ ${waited} -lt ${max_wait} ]]; do
+        sleep 1
+        ((waited++))
+    done
+    
+    if is_safari_running; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Safari Preference Functions
+# ------------------------------------------------------------------------------
+
+backup_safari_prefs() {
+    local db_path="$1"
+    local backup_path="${db_path}.backup.$(date +%Y%m%d%H%M%S)"
+    
+    if [[ -f "${db_path}" ]]; then
+        /bin/cp "${db_path}" "${backup_path}"
+        log_info "Created backup at ${backup_path}"
+        return 0
+    fi
+    
+    return 1
+}
+
+convert_wildcard_to_safari_format() {
+    # Safari stores wildcard domains without the asterisk prefix
+    local domain="$1"
+    
+    if [[ "${domain}" == \*\.* ]]; then
+        echo "${domain#\*.}"
+    else
+        echo "${domain}"
+    fi
+}
+
+add_popup_permission_to_db() {
+    local db_path="$1"
+    local domain="$2"
+    local user_home="$3"
+    local username="$4"
+    
+    # Safari uses a specific preference key for pop-up policies
+    local preference_key="PerSitePreferencePopUpPolicy"
+    
+    # Check if database exists
+    if [[ ! -f "${db_path}" ]]; then
+        log_warn "Safari preferences database not found at ${db_path}"
+        log_info "Will attempt to create preference via defaults"
+        return 1
+    fi
+    
+    # Convert wildcard format for Safari storage
+    local safari_domain
+    safari_domain=$(convert_wildcard_to_safari_format "${domain}")
+    
+    # Check if entry already exists
+    local existing
+    existing=$(/usr/bin/sqlite3 "${db_path}" \
+        "SELECT preference_value FROM default_preferences WHERE domain = '${safari_domain}' AND preference_key = '${preference_key}';" 2>/dev/null || echo "")
+    
+    if [[ "${existing}" == "${POPUP_ALLOW}" ]]; then
+        log_info "Pop-up permission already set for ${domain}"
+        return 0
+    fi
+    
+    # Insert or update the preference
+    /usr/bin/sqlite3 "${db_path}" <<EOF
+INSERT OR REPLACE INTO default_preferences (domain, preference_key, preference_value)
+VALUES ('${safari_domain}', '${preference_key}', ${POPUP_ALLOW});
+EOF
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Added pop-up permission for ${domain}"
+        
+        # Fix ownership
+        /usr/sbin/chown "${username}" "${db_path}"
+        
+        return 0
+    else
+        log_error "Failed to add pop-up permission for ${domain}"
+        return 1
+    fi
+}
+
+add_popup_via_defaults() {
+    # Alternative method using defaults command for managed preferences
+    local domain="$1"
+    local username="$2"
+    local uid="$3"
+    
+    local safari_domain
+    safari_domain=$(convert_wildcard_to_safari_format "${domain}")
+    
+    log_info "Attempting to set preference via defaults for ${domain}"
+    
+    # Use launchctl to run as the user context
+    /bin/launchctl asuser "${uid}" /usr/bin/sudo -u "${username}" \
+        /usr/bin/defaults write com.apple.Safari \
+        "com.apple.Safari.ContentPageGroupIdentifier.WebKit2JavaScriptCanOpenWindowsAutomatically.${safari_domain}" \
+        -bool true 2>/dev/null
+    
+    return $?
+}
+
+# ------------------------------------------------------------------------------
+# Main Functions
+# ------------------------------------------------------------------------------
+
+check_prerequisites() {
+    log_info "Checking prerequisites"
+    
+    # Verify running on macOS
+    if [[ "$(uname)" != "Darwin" ]]; then
+        log_error "This script only runs on macOS"
+        return 1
+    fi
+    
+    # Verify sqlite3 is available
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        log_error "sqlite3 command not found"
+        return 1
+    fi
+    
+    # Check for root privileges (required for Jamf deployment)
+    if [[ ${EUID} -ne 0 ]]; then
+        log_warn "Script not running as root - some operations may fail"
+    fi
+    
+    log_info "Prerequisites check passed"
+    return 0
+}
+
+process_user() {
+    local username="$1"
+    local user_home="$2"
+    local user_uid="$3"
+    local success_count=0
+    local fail_count=0
+    
+    log_info "Processing user: ${username}"
+    
+    local safari_prefs_dir="${user_home}/Library/Safari"
+    local prefs_db="${safari_prefs_dir}/PerSitePreferences.db"
+    
+    # Check if Safari directory exists
+    if [[ ! -d "${safari_prefs_dir}" ]]; then
+        log_warn "Safari preferences directory not found for ${username}"
+        log_info "User may not have launched Safari yet - will use defaults method"
+    fi
+    
+    # Backup existing preferences if database exists
+    if [[ -f "${prefs_db}" ]]; then
+        backup_safari_prefs "${prefs_db}"
+    fi
+    
+    # Process each domain
+    for domain in "${ALLOWED_DOMAINS[@]}"; do
+        log_info "Processing domain: ${domain}"
+        
+        if [[ -f "${prefs_db}" ]]; then
+            if add_popup_permission_to_db "${prefs_db}" "${domain}" "${user_home}" "${username}"; then
+                ((success_count++))
+            else
+                # Fall back to defaults method
+                if add_popup_via_defaults "${domain}" "${username}" "${user_uid}"; then
+                    ((success_count++))
+                else
+                    ((fail_count++))
+                fi
+            fi
+        else
+            if add_popup_via_defaults "${domain}" "${username}" "${user_uid}"; then
+                ((success_count++))
+            else
+                ((fail_count++))
+            fi
+        fi
+    done
+    
+    log_info "Completed processing for ${username}: ${success_count} succeeded, ${fail_count} failed"
+    
+    [[ ${fail_count} -eq 0 ]]
+}
+
+main() {
+    log_info "========================================"
+    log_info "Starting ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    log_info "========================================"
+    
+    if ! check_prerequisites; then
+        log_error "Prerequisites check failed"
+        exit 1
+    fi
+    
+    # Get current logged-in user
+    local current_user
+    current_user=$(get_current_user)
+    
+    if [[ -z "${current_user}" ]]; then
+        log_error "No user currently logged in"
+        exit 1
+    fi
+    
+    log_info "Current user: ${current_user}"
+    
+    # Get user home directory and UID
+    local user_home
+    user_home=$(get_user_home "${current_user}")
+    
+    if [[ -z "${user_home}" ]]; then
+        log_error "Could not determine home directory for ${current_user}"
+        exit 1
+    fi
+    
+    local user_uid
+    user_uid=$(get_user_uid "${current_user}")
+    
+    if [[ -z "${user_uid}" ]]; then
+        log_error "Could not determine UID for ${current_user}"
+        exit 1
+    fi
+    
+    log_info "User home: ${user_home}"
+    log_info "User UID: ${user_uid}"
+    
+    # Check if Safari is running
+    if is_safari_running; then
+        log_warn "Safari is currently running"
+        log_info "Changes will take effect after Safari restart"
+    fi
+    
+    # Process the user
+    if process_user "${current_user}" "${user_home}" "${user_uid}"; then
+        log_success "Script completed successfully"
+        exit 0
+    else
+        log_error "Script completed with errors"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+
+main "$@"
