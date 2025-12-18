@@ -5,9 +5,7 @@ setopt ERR_EXIT NO_UNSET PIPE_FAIL
 readonly SCRIPT_VERSION="1.0.0"
 
 # Configuration
-readonly CORPORATE_SSID=""
-readonly TEST_HOST=""
-readonly EXPECTED_DNS_SUFFIX=""
+@@@
 readonly LOG_FILE="/var/log/file-sharing-manager.log"
 readonly AUDIT_LOG="/var/log/file-sharing-audit.log"
 readonly PF_ANCHOR="file-sharing-block"
@@ -560,16 +558,61 @@ disable_file_sharing() {
     return 0
 }
 
+ensure_pf_anchor_loaded() {
+    local pf_conf="/etc/pf.conf"
+    local anchor_line="anchor \"${PF_ANCHOR}\""
+    local load_anchor_line="load anchor \"${PF_ANCHOR}\" from \"/etc/pf.anchors/${PF_ANCHOR}\""
+    local pf_conf_modified=false
+    
+    if [[ ! -f "${pf_conf}" ]]; then
+        log_message "warn" "PF configuration file ${pf_conf} does not exist, creating default"
+        cat > "${pf_conf}" << 'EOF'
+# Default PF configuration for macOS
+scrub-anchor "com.apple/*"
+nat-anchor "com.apple/*"
+rdr-anchor "com.apple/*"
+dummynet-anchor "com.apple/*"
+anchor "com.apple/*"
+load anchor "com.apple" from "/etc/pf.anchors/com.apple"
+EOF
+        pf_conf_modified=true
+    fi
+    
+    if ! grep -q "^anchor \"${PF_ANCHOR}\"" "${pf_conf}" 2>/dev/null; then
+        log_message "info" "Adding anchor reference to ${pf_conf}"
+        echo "" >> "${pf_conf}"
+        echo "# File sharing manager anchor" >> "${pf_conf}"
+        echo "${anchor_line}" >> "${pf_conf}"
+        pf_conf_modified=true
+    fi
+    
+    if [[ "${pf_conf_modified}" == true ]]; then
+        if ! pfctl -f "${pf_conf}" 2>/dev/null; then
+            log_message "error" "Failed to reload PF configuration"
+            return 1
+        fi
+        log_message "info" "PF configuration reloaded"
+    fi
+    
+    return 0
+}
+
 apply_pf_rules() {
     local port
     local pf_was_enabled=false
+    local rules_file="/etc/pf.anchors/${PF_ANCHOR}"
     
     log_message "info" "Applying PF firewall rules to block file sharing ports"
+    
+    if [[ ! -d "/etc/pf.anchors" ]]; then
+        mkdir -p "/etc/pf.anchors"
+        chmod 755 "/etc/pf.anchors"
+    fi
     
     TEMP_RULES_FILE=$(mktemp /tmp/pf-file-sharing.XXXXXX)
     
     cat > "${TEMP_RULES_FILE}" << 'EOF'
-# Block file sharing ports inbound and outbound
+# Block all file sharing ports inbound and outbound
 EOF
     
     for port in "${BLOCK_PORTS[@]}"; do
@@ -579,8 +622,16 @@ EOF
         echo "block drop out quick proto udp from any to any port ${port}" >> "${TEMP_RULES_FILE}"
     done
     
+    cp "${TEMP_RULES_FILE}" "${rules_file}"
+    chmod 644 "${rules_file}"
+    
     if pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
         pf_was_enabled=true
+    fi
+    
+    if ! ensure_pf_anchor_loaded; then
+        log_message "error" "Failed to configure PF anchor"
+        return 1
     fi
     
     if [[ "${pf_was_enabled}" == false ]]; then
@@ -591,7 +642,7 @@ EOF
         fi
     fi
     
-    if ! pfctl -a "${PF_ANCHOR}" -f "${TEMP_RULES_FILE}" 2>/dev/null; then
+    if ! pfctl -a "${PF_ANCHOR}" -f "${rules_file}" 2>/dev/null; then
         log_message "error" "Failed to apply PF rules"
         
         if [[ "${pf_was_enabled}" == false ]]; then
@@ -601,18 +652,55 @@ EOF
         return 1
     fi
     
-    log_message "info" "PF rules applied successfully"
+    if ! verify_pf_rules_active; then
+        log_message "error" "PF rules loaded but not active"
+        return 1
+    fi
+    
+    log_message "info" "PF rules applied and verified active"
+    return 0
+}
+
+verify_pf_rules_active() {
+    local rules_count
+    
+    rules_count=$(pfctl -a "${PF_ANCHOR}" -sr 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [[ "${rules_count}" -eq 0 ]]; then
+        log_message "error" "No rules found in anchor ${PF_ANCHOR}"
+        return 1
+    fi
+    
+    log_message "debug" "PF anchor contains ${rules_count} active rules"
     return 0
 }
 
 remove_pf_rules() {
+    local rules_file="/etc/pf.anchors/${PF_ANCHOR}"
+    
     log_message "info" "Removing PF firewall rules"
     
     if pfctl -a "${PF_ANCHOR}" -F all 2>/dev/null; then
-        log_message "info" "PF rules removed successfully"
+        log_message "info" "PF rules flushed from anchor"
     else
-        log_message "debug" "No PF rules to remove or PF not available"
+        log_message "debug" "No PF rules to flush from anchor"
     fi
+    
+    if [[ -f "${rules_file}" ]]; then
+        rm -f "${rules_file}"
+        log_message "debug" "Removed anchor rules file"
+    fi
+    
+    local rules_count
+    rules_count=$(pfctl -a "${PF_ANCHOR}" -sr 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [[ ${rules_count} -gt 0 ]]; then
+        log_message "warn" "PF rules still active after removal attempt (${rules_count} rules remain)"
+        return 1
+    fi
+    
+    log_message "info" "PF rules removed successfully"
+    return 0
 }
 
 check_root_privileges() {
@@ -661,12 +749,39 @@ show_status() {
         fi
     done
     echo ""
-    echo "PF Firewall Rules:"
-    if pfctl -a "${PF_ANCHOR}" -sr 2>/dev/null | grep -q "block"; then
-        echo "  Status: ACTIVE"
-        pfctl -a "${PF_ANCHOR}" -sr 2>/dev/null | head -5
+    echo "PF Firewall Configuration:"
+    if pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then
+        echo "  PF Status: ENABLED"
     else
-        echo "  Status: NO RULES LOADED"
+        echo "  PF Status: DISABLED"
+    fi
+    
+    if grep -q "^anchor \"${PF_ANCHOR}\"" /etc/pf.conf 2>/dev/null; then
+        echo "  Anchor in pf.conf: YES"
+    else
+        echo "  Anchor in pf.conf: NO (rules will not be active)"
+    fi
+    
+    if [[ -f "/etc/pf.anchors/${PF_ANCHOR}" ]]; then
+        echo "  Anchor file exists: YES"
+    else
+        echo "  Anchor file exists: NO"
+    fi
+    
+    echo ""
+    echo "Active PF Rules in Anchor:"
+    local rules_output
+    rules_output=$(pfctl -a "${PF_ANCHOR}" -sr 2>/dev/null)
+    
+    if [[ -n "${rules_output}" ]]; then
+        echo "${rules_output}" | head -10
+        local rule_count
+        rule_count=$(echo "${rules_output}" | wc -l | tr -d ' ')
+        if [[ ${rule_count} -gt 10 ]]; then
+            echo "  ... (${rule_count} total rules, showing first 10)"
+        fi
+    else
+        echo "  NO ACTIVE RULES (file sharing not blocked)"
     fi
 }
 
