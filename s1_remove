@@ -4,7 +4,7 @@
 # Purpose: Verify Microsoft Defender health before removing SentinelOne legacy artefacts
 # Deployment: Jamf Pro Policy
 # Author: David Crosby (Bing)
-# Version: 1.1.0
+# Version: 1.2.0
 
 # Exit codes
 readonly EXIT_SUCCESS=0
@@ -12,6 +12,7 @@ readonly EXIT_DEFENDER_NOT_INSTALLED=1
 readonly EXIT_DEFENDER_UNHEALTHY=2
 readonly EXIT_SENTINELONE_REMOVAL_FAILED=3
 readonly EXIT_INSUFFICIENT_PRIVILEGES=4
+readonly EXIT_MISSING_DEPENDENCIES=5
 
 # Logging function to standardise output for Jamf
 log_message() {
@@ -49,6 +50,21 @@ readonly SENTINELONE_PATHS=(
 readonly DRY_RUN="${4:-false}"
 readonly SKIP_DLP_CHECK="${5:-false}"
 readonly REQUIRE_RESTART="${6:-false}"
+
+check_dependencies() {
+    log_message "INFO" "Checking for required dependencies"
+    
+    if ! command -v jq &>/dev/null; then
+        log_message "ERROR" "jq is not installed or not in PATH"
+        log_message "ERROR" "jq is required for JSON parsing"
+        log_message "ERROR" "Install via Homebrew: brew install jq"
+        log_message "ERROR" "Or deploy jq binary via Jamf before running this script"
+        return 1
+    fi
+    
+    log_message "INFO" "All required dependencies present"
+    return 0
+}
 
 check_root_privileges() {
     log_message "INFO" "Checking for root privileges"
@@ -98,6 +114,12 @@ check_defender_health() {
         return 1
     fi
     
+    if ! echo "${health_output}" | jq empty 2>/dev/null; then
+        log_message "ERROR" "Defender health output is not valid JSON"
+        log_message "ERROR" "Output: ${health_output}"
+        return 1
+    fi
+    
     log_message "INFO" "Successfully retrieved Defender health information"
     echo "${health_output}"
     return 0
@@ -109,21 +131,19 @@ parse_json_field() {
     local default="${3:-unknown}"
     
     local result
-    result=$(echo "${json}" | /usr/bin/python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    value = data.get('${field}', '${default}')
-    print(value)
-except Exception as e:
-    print('${default}')
-    sys.exit(1)
-" 2>&1)
+    local exit_code
     
-    local parse_exit=$?
+    result=$(echo "${json}" | jq -r ".${field} // \"${default}\"" 2>&1)
+    exit_code=$?
     
-    if [[ ${parse_exit} -ne 0 ]]; then
+    if [[ ${exit_code} -ne 0 ]]; then
         log_message "WARNING" "Failed to parse JSON field '${field}'"
+        log_message "DEBUG" "jq error: ${result}"
+        echo "${default}"
+        return 1
+    fi
+    
+    if [[ -z "${result}" || "${result}" == "null" ]]; then
         echo "${default}"
         return 1
     fi
@@ -144,7 +164,7 @@ verify_real_time_protection() {
         return 1
     fi
     
-    if [[ "${rtp_enabled}" != "True" && "${rtp_enabled}" != "true" ]]; then
+    if [[ "${rtp_enabled}" != "true" ]]; then
         log_message "ERROR" "Real-Time Protection is not enabled (status: ${rtp_enabled})"
         return 1
     fi
@@ -193,7 +213,7 @@ verify_dlp_enabled() {
         return 0
     fi
     
-    if [[ "${dlp_enabled}" != "True" && "${dlp_enabled}" != "true" ]]; then
+    if [[ "${dlp_enabled}" != "true" ]]; then
         log_message "WARNING" "Data Loss Prevention is not enabled (status: ${dlp_enabled})"
         log_message "WARNING" "Continuing as DLP may not be configured in your environment"
         return 0
@@ -449,12 +469,16 @@ remove_sentinelone_artefacts() {
 
 main() {
     log_message "INFO" "Starting SentinelOne legacy removal workflow"
-    log_message "INFO" "Script version: 1.1.0"
+    log_message "INFO" "Script version: 1.2.0"
     log_message "INFO" "Dry run mode: ${DRY_RUN}"
     log_message "INFO" "Skip DLP check: ${SKIP_DLP_CHECK}"
     log_message "INFO" "Require restart acknowledged: ${REQUIRE_RESTART}"
     
     check_root_privileges
+    
+    if ! check_dependencies; then
+        error_exit ${EXIT_MISSING_DEPENDENCIES} "Required dependencies not available"
+    fi
     
     if ! check_defender_installation; then
         error_exit ${EXIT_DEFENDER_NOT_INSTALLED} "Microsoft Defender pre-flight check failed"
