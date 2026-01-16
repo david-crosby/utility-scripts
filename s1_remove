@@ -1,0 +1,489 @@
+#!/bin/zsh
+
+# Script: remove_sentinelone_legacy.sh
+# Purpose: Verify Microsoft Defender health before removing SentinelOne legacy artefacts
+# Deployment: Jamf Pro Policy
+# Author: David Crosby (Bing)
+# Version: 1.1.0
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_DEFENDER_NOT_INSTALLED=1
+readonly EXIT_DEFENDER_UNHEALTHY=2
+readonly EXIT_SENTINELONE_REMOVAL_FAILED=3
+readonly EXIT_INSUFFICIENT_PRIVILEGES=4
+
+# Logging function to standardise output for Jamf
+log_message() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*"
+}
+
+# Error handler
+error_exit() {
+    local exit_code="$1"
+    shift
+    log_message "FATAL" "$*"
+    exit "${exit_code}"
+}
+
+# Microsoft Defender paths and settings
+readonly DEFENDER_APP="/Applications/Microsoft Defender.app"
+readonly DEFENDER_CLI="/usr/local/bin/mdatp"
+readonly WDAV_PLIST="/Library/Preferences/com.microsoft.wdav.plist"
+
+# SentinelOne legacy paths
+readonly SENTINELONE_PATHS=(
+    "/Applications/SentinelOne"
+    "/Library/Application Support/SentinelOne"
+    "/Library/LaunchDaemons/com.sentinelone.*"
+    "/Library/LaunchAgents/com.sentinelone.*"
+    "/Library/Extensions/com.sentinelone.*"
+    "/Library/Preferences/com.sentinelone.*"
+    "/var/log/sentinelone"
+    "/usr/local/bin/sentinelctl"
+)
+
+# Jamf script parameters
+readonly DRY_RUN="${4:-false}"
+readonly SKIP_DLP_CHECK="${5:-false}"
+readonly REQUIRE_RESTART="${6:-false}"
+
+check_root_privileges() {
+    log_message "INFO" "Checking for root privileges"
+    
+    if [[ $EUID -ne 0 ]]; then
+        error_exit ${EXIT_INSUFFICIENT_PRIVILEGES} "This script must be run as root"
+    fi
+    
+    log_message "INFO" "Root privileges confirmed"
+    return 0
+}
+
+check_defender_installation() {
+    log_message "INFO" "Checking Microsoft Defender installation"
+    
+    if [[ ! -d "${DEFENDER_APP}" ]]; then
+        log_message "ERROR" "Microsoft Defender application not found at ${DEFENDER_APP}"
+        return 1
+    fi
+    
+    if [[ ! -x "${DEFENDER_CLI}" ]]; then
+        log_message "ERROR" "Microsoft Defender CLI not found or not executable at ${DEFENDER_CLI}"
+        return 1
+    fi
+    
+    log_message "INFO" "Microsoft Defender installation verified"
+    return 0
+}
+
+check_defender_health() {
+    log_message "INFO" "Checking Microsoft Defender health status"
+    
+    local health_output
+    local exit_code
+    
+    health_output=$("${DEFENDER_CLI}" health --format json 2>&1)
+    exit_code=$?
+    
+    if [[ ${exit_code} -ne 0 ]]; then
+        log_message "ERROR" "Failed to retrieve Defender health status"
+        log_message "ERROR" "Command output: ${health_output}"
+        return 1
+    fi
+    
+    if [[ -z "${health_output}" ]]; then
+        log_message "ERROR" "Defender health command returned empty output"
+        return 1
+    fi
+    
+    log_message "INFO" "Successfully retrieved Defender health information"
+    echo "${health_output}"
+    return 0
+}
+
+parse_json_field() {
+    local json="$1"
+    local field="$2"
+    local default="${3:-unknown}"
+    
+    local result
+    result=$(echo "${json}" | /usr/bin/python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    value = data.get('${field}', '${default}')
+    print(value)
+except Exception as e:
+    print('${default}')
+    sys.exit(1)
+" 2>&1)
+    
+    local parse_exit=$?
+    
+    if [[ ${parse_exit} -ne 0 ]]; then
+        log_message "WARNING" "Failed to parse JSON field '${field}'"
+        echo "${default}"
+        return 1
+    fi
+    
+    echo "${result}"
+    return 0
+}
+
+verify_real_time_protection() {
+    local health_json="$1"
+    log_message "INFO" "Verifying Real-Time Protection status"
+    
+    local rtp_enabled
+    rtp_enabled=$(parse_json_field "${health_json}" "real_time_protection_enabled" "unknown")
+    
+    if [[ "${rtp_enabled}" == "unknown" ]]; then
+        log_message "ERROR" "Unable to determine Real-Time Protection status"
+        return 1
+    fi
+    
+    if [[ "${rtp_enabled}" != "True" && "${rtp_enabled}" != "true" ]]; then
+        log_message "ERROR" "Real-Time Protection is not enabled (status: ${rtp_enabled})"
+        return 1
+    fi
+    
+    log_message "INFO" "Real-Time Protection is enabled"
+    return 0
+}
+
+verify_definitions_current() {
+    local health_json="$1"
+    log_message "INFO" "Verifying threat definitions are current"
+    
+    local definitions_status
+    definitions_status=$(parse_json_field "${health_json}" "definitions_status" "unknown")
+    
+    if [[ "${definitions_status}" == "unknown" ]]; then
+        log_message "ERROR" "Unable to determine definitions status"
+        return 1
+    fi
+    
+    if [[ "${definitions_status}" != "up_to_date" ]]; then
+        log_message "WARNING" "Definitions status: ${definitions_status}"
+        log_message "ERROR" "Threat definitions are not up to date"
+        return 1
+    fi
+    
+    log_message "INFO" "Threat definitions are up to date"
+    return 0
+}
+
+verify_dlp_enabled() {
+    local health_json="$1"
+    
+    if [[ "${SKIP_DLP_CHECK}" == "true" ]]; then
+        log_message "INFO" "Skipping Data Loss Prevention check (disabled via parameter)"
+        return 0
+    fi
+    
+    log_message "INFO" "Verifying Data Loss Prevention status"
+    
+    local dlp_enabled
+    dlp_enabled=$(parse_json_field "${health_json}" "data_loss_prevention_enabled" "unknown")
+    
+    if [[ "${dlp_enabled}" == "unknown" ]]; then
+        log_message "WARNING" "Unable to determine DLP status, continuing anyway"
+        return 0
+    fi
+    
+    if [[ "${dlp_enabled}" != "True" && "${dlp_enabled}" != "true" ]]; then
+        log_message "WARNING" "Data Loss Prevention is not enabled (status: ${dlp_enabled})"
+        log_message "WARNING" "Continuing as DLP may not be configured in your environment"
+        return 0
+    fi
+    
+    log_message "INFO" "Data Loss Prevention is enabled"
+    return 0
+}
+
+verify_tamper_protection() {
+    log_message "INFO" "Verifying Tamper Protection status"
+    
+    local tamper_status
+    local exit_code
+    
+    tamper_status=$("${DEFENDER_CLI}" config tamper-protection --value 2>&1)
+    exit_code=$?
+    
+    if [[ ${exit_code} -ne 0 ]]; then
+        log_message "WARNING" "Unable to determine Tamper Protection status"
+        log_message "WARNING" "Command output: ${tamper_status}"
+        return 0
+    fi
+    
+    if [[ "${tamper_status}" != "enabled" && "${tamper_status}" != "audit" ]]; then
+        log_message "ERROR" "Tamper Protection is not enabled (status: ${tamper_status})"
+        return 1
+    fi
+    
+    log_message "INFO" "Tamper Protection status: ${tamper_status}"
+    return 0
+}
+
+unload_launch_item() {
+    local item="$1"
+    local item_type=""
+    
+    if [[ "${item}" == /Library/LaunchDaemons/* ]]; then
+        item_type="LaunchDaemon"
+    elif [[ "${item}" == /Library/LaunchAgents/* ]]; then
+        item_type="LaunchAgent"
+    else
+        return 0
+    fi
+    
+    log_message "INFO" "Attempting to unload ${item_type}: ${item}"
+    
+    local unload_output
+    local exit_code
+    
+    unload_output=$(/bin/launchctl unload "${item}" 2>&1)
+    exit_code=$?
+    
+    if [[ ${exit_code} -eq 0 ]]; then
+        log_message "INFO" "Successfully unloaded ${item_type}: ${item}"
+    else
+        log_message "WARNING" "Failed to unload ${item_type} (may not be loaded): ${item}"
+        log_message "DEBUG" "Unload output: ${unload_output}"
+    fi
+    
+    return 0
+}
+
+validate_removal_path() {
+    local path="$1"
+    
+    case "${path}" in
+        /Applications/SentinelOne*)
+            return 0
+            ;;
+        /Library/Application\ Support/SentinelOne*)
+            return 0
+            ;;
+        /Library/LaunchDaemons/com.sentinelone.*)
+            return 0
+            ;;
+        /Library/LaunchAgents/com.sentinelone.*)
+            return 0
+            ;;
+        /Library/Extensions/com.sentinelone.*)
+            return 0
+            ;;
+        /Library/Preferences/com.sentinelone.*)
+            return 0
+            ;;
+        /var/log/sentinelone*)
+            return 0
+            ;;
+        /usr/local/bin/sentinelctl)
+            return 0
+            ;;
+        *)
+            log_message "ERROR" "Path validation failed for: ${path}"
+            return 1
+            ;;
+    esac
+}
+
+check_for_kernel_extensions() {
+    log_message "INFO" "Checking for kernel extensions"
+    
+    local kexts_found=0
+    
+    for kext in /Library/Extensions/com.sentinelone.*.kext(N); do
+        if [[ -d "${kext}" ]]; then
+            log_message "WARNING" "Kernel extension found: ${kext}"
+            kexts_found=1
+        fi
+    done
+    
+    if [[ ${kexts_found} -eq 1 ]]; then
+        log_message "WARNING" "System restart will be required after kernel extension removal"
+        if [[ "${REQUIRE_RESTART}" == "true" ]]; then
+            log_message "INFO" "Restart requirement acknowledged via parameter"
+        fi
+    fi
+    
+    return 0
+}
+
+find_sentinelone_artefacts() {
+    log_message "INFO" "Scanning for SentinelOne legacy artefacts"
+    
+    local -a found_items
+    
+    for path_pattern in "${SENTINELONE_PATHS[@]}"; do
+        if [[ "${path_pattern}" == *"*"* ]]; then
+            local parent_dir
+            local pattern
+            parent_dir="${path_pattern%/*}"
+            pattern="${path_pattern##*/}"
+            
+            if [[ ! -d "${parent_dir}" ]]; then
+                continue
+            fi
+            
+            while IFS= read -r item; do
+                if [[ -n "${item}" ]]; then
+                    found_items+=("${item}")
+                    log_message "INFO" "Found legacy artefact: ${item}"
+                fi
+            done < <(find "${parent_dir}" -maxdepth 1 -name "${pattern}" 2>/dev/null)
+        else
+            if [[ -e "${path_pattern}" ]]; then
+                found_items+=("${path_pattern}")
+                log_message "INFO" "Found legacy artefact: ${path_pattern}"
+            fi
+        fi
+    done
+    
+    if [[ ${#found_items[@]} -eq 0 ]]; then
+        log_message "INFO" "No SentinelOne legacy artefacts found"
+        return 1
+    fi
+    
+    printf '%s\n' "${found_items[@]}"
+    return 0
+}
+
+remove_item() {
+    local item="$1"
+    
+    if ! validate_removal_path "${item}"; then
+        log_message "ERROR" "Refusing to remove item that failed path validation: ${item}"
+        return 1
+    fi
+    
+    unload_launch_item "${item}"
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_message "INFO" "[DRY RUN] Would remove: ${item}"
+        return 0
+    fi
+    
+    log_message "INFO" "Attempting to remove: ${item}"
+    
+    local rm_output
+    local exit_code
+    
+    if [[ -d "${item}" ]]; then
+        rm_output=$(/bin/rm -rf "${item}" 2>&1)
+        exit_code=$?
+        
+        if [[ ${exit_code} -eq 0 ]]; then
+            log_message "INFO" "Successfully removed directory: ${item}"
+            return 0
+        else
+            log_message "ERROR" "Failed to remove directory: ${item}"
+            log_message "ERROR" "Error output: ${rm_output}"
+            return 1
+        fi
+    elif [[ -f "${item}" || -L "${item}" ]]; then
+        rm_output=$(/bin/rm -f "${item}" 2>&1)
+        exit_code=$?
+        
+        if [[ ${exit_code} -eq 0 ]]; then
+            log_message "INFO" "Successfully removed file: ${item}"
+            return 0
+        else
+            log_message "ERROR" "Failed to remove file: ${item}"
+            log_message "ERROR" "Error output: ${rm_output}"
+            return 1
+        fi
+    else
+        log_message "WARNING" "Item does not exist or is unsupported type: ${item}"
+        return 0
+    fi
+}
+
+remove_sentinelone_artefacts() {
+    log_message "INFO" "Beginning removal of SentinelOne legacy artefacts"
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_message "INFO" "DRY RUN MODE: No files will be actually removed"
+    fi
+    
+    check_for_kernel_extensions
+    
+    local artefacts
+    if ! artefacts=$(find_sentinelone_artefacts); then
+        log_message "INFO" "No artefacts to remove"
+        return 0
+    fi
+    
+    local removal_failed=0
+    local items_removed=0
+    local items_failed=0
+    
+    while IFS= read -r item; do
+        if remove_item "${item}"; then
+            ((items_removed++))
+        else
+            ((items_failed++))
+            removal_failed=1
+        fi
+    done <<< "${artefacts}"
+    
+    log_message "INFO" "Removal summary: ${items_removed} succeeded, ${items_failed} failed"
+    
+    if [[ ${removal_failed} -eq 1 ]]; then
+        log_message "ERROR" "Some SentinelOne artefacts could not be removed"
+        return 1
+    fi
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_message "INFO" "DRY RUN completed - no actual changes made"
+    else
+        log_message "INFO" "All SentinelOne legacy artefacts successfully removed"
+    fi
+    
+    return 0
+}
+
+main() {
+    log_message "INFO" "Starting SentinelOne legacy removal workflow"
+    log_message "INFO" "Script version: 1.1.0"
+    log_message "INFO" "Dry run mode: ${DRY_RUN}"
+    log_message "INFO" "Skip DLP check: ${SKIP_DLP_CHECK}"
+    log_message "INFO" "Require restart acknowledged: ${REQUIRE_RESTART}"
+    
+    check_root_privileges
+    
+    if ! check_defender_installation; then
+        error_exit ${EXIT_DEFENDER_NOT_INSTALLED} "Microsoft Defender pre-flight check failed"
+    fi
+    
+    local health_json
+    if ! health_json=$(check_defender_health); then
+        error_exit ${EXIT_DEFENDER_UNHEALTHY} "Unable to determine Defender health status"
+    fi
+    
+    local health_check_failed=0
+    
+    verify_real_time_protection "${health_json}" || health_check_failed=1
+    verify_definitions_current "${health_json}" || health_check_failed=1
+    verify_dlp_enabled "${health_json}" || health_check_failed=1
+    verify_tamper_protection || health_check_failed=1
+    
+    if [[ ${health_check_failed} -eq 1 ]]; then
+        error_exit ${EXIT_DEFENDER_UNHEALTHY} "Microsoft Defender health checks failed - aborting SentinelOne removal for safety"
+    fi
+    
+    log_message "INFO" "All Microsoft Defender health checks passed"
+    
+    if ! remove_sentinelone_artefacts; then
+        error_exit ${EXIT_SENTINELONE_REMOVAL_FAILED} "SentinelOne removal completed with errors"
+    fi
+    
+    log_message "INFO" "SentinelOne legacy removal workflow completed successfully"
+    exit ${EXIT_SUCCESS}
+}
+
+main "$@"
