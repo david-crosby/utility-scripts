@@ -1,0 +1,97 @@
+#!/bin/zsh
+
+# Enable Location Services system-wide and grant permission to Cisco Thousand Eyes
+
+set -e
+
+BUNDLE_ID="com.thousandeyes.eyebrow.entr"
+LOCATIOND_PLIST="/var/db/locationd/clients.plist"
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root"
+        exit 1
+    fi
+}
+
+enable_location_services() {
+    local hw_uuid
+    hw_uuid=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/{print $4}')
+    
+    if [[ -z "$hw_uuid" ]]; then
+        echo "Error: Failed to retrieve hardware UUID"
+        return 1
+    fi
+    
+    local pref_file="/var/db/locationd/Library/Preferences/ByHost/com.apple.locationd.${hw_uuid}.plist"
+    
+    /usr/bin/defaults write "$pref_file" LocationServicesEnabled -int 1
+    
+    /usr/bin/defaults write /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled -int 1
+    
+    /bin/launchctl kickstart -k system/com.apple.locationd
+    
+    return 0
+}
+
+verify_app_installed() {
+    if ! /usr/bin/mdfind "kMDItemCFBundleIdentifier == '${BUNDLE_ID}'" | /usr/bin/grep -q ".app"; then
+        echo "Error: Application with bundle ID ${BUNDLE_ID} not found"
+        exit 1
+    fi
+}
+
+grant_location_permission() {
+    if [[ ! -f "$LOCATIOND_PLIST" ]]; then
+        echo "Error: Location services database not found"
+        return 1
+    fi
+    
+    local temp_plist="/tmp/locationd_clients_temp.plist"
+    
+    /usr/bin/plutil -convert xml1 "$LOCATIOND_PLIST" -o "$temp_plist"
+    
+    if /usr/libexec/PlistBuddy -c "Print :${BUNDLE_ID}" "$temp_plist" &>/dev/null; then
+        /usr/libexec/PlistBuddy -c "Set :${BUNDLE_ID}:Authorized true" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Set :${BUNDLE_ID}:Requirement 'identifier \"${BUNDLE_ID}\"'" "$temp_plist" 2>/dev/null || true
+    else
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID} dict" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:Authorized bool true" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:BundleId string ${BUNDLE_ID}" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:Executable string" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:Registered string" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:Requirement string 'identifier \"${BUNDLE_ID}\"'" "$temp_plist"
+        /usr/libexec/PlistBuddy -c "Add :${BUNDLE_ID}:Whitelisted bool false" "$temp_plist"
+    fi
+    
+    /usr/bin/plutil -convert binary1 "$temp_plist"
+    /bin/cp "$temp_plist" "$LOCATIOND_PLIST"
+    /bin/chmod 644 "$LOCATIOND_PLIST"
+    /usr/sbin/chown _locationd:_locationd "$LOCATIOND_PLIST"
+    
+    /bin/rm "$temp_plist"
+    
+    /bin/launchctl kickstart -k system/com.apple.locationd
+    
+    return 0
+}
+
+main() {
+    check_root
+    
+    verify_app_installed
+    
+    if ! enable_location_services; then
+        echo "Warning: Failed to enable Location Services system-wide"
+    fi
+    
+    if grant_location_permission; then
+        echo "Successfully granted Location Services permission to ${BUNDLE_ID}"
+        exit 0
+    else
+        echo "Error: Failed to grant Location Services permission"
+        exit 1
+    fi
+}
+
+main
